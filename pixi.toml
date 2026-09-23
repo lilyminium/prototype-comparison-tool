@@ -1,0 +1,44 @@
+[workspace]
+name = "sage-training-explorer"
+channels = ["conda-forge"]
+platforms = [{ name = "osx-arm64-macos15", platform = "osx-arm64", macos = "15.0" }, "linux-64"]
+
+[dependencies]
+python = "3.12.*"
+rdkit = "==2026.03.6"   # must match the vendored @rdkit/rdkit 2026.3.6
+openff-toolkit-base = "*"
+openff-forcefields = "*"
+openff-interchange-base = "*"
+openff-nagl = "*"
+openff-nagl-models = "*"
+openmm = "*"
+qcportal = "*"
+zstandard = "*"
+msgpack-python = "*"
+numpy = "*"
+pandas = "*"
+pyarrow = "*"
+pytest = "*"
+nodejs = ">=22"
+
+[tasks]
+# Raw data (network). The TorsionDrive data come from QCArchive, not the 14.7 GB Zenodo view.
+download = "python scripts/01_download.py"
+ledger = "python scripts/02_ledger.py"
+fetch-td = "python scripts/02b_fetch_torsiondrive.py"
+# Processing (deterministic, offline)
+extract = "python scripts/03_extract.py"
+label = { cmd = "python scripts/04_label.py", depends-on = ["extract"] }
+geometry = { cmd = "python scripts/05_geometry.py", depends-on = ["label"] }
+validate-energy = { cmd = "python scripts/06_validate_energy.py --self-test", depends-on = ["geometry"] }
+fingerprints = { cmd = "python scripts/07a_fp_input.py && node scripts/07_fingerprints.mjs && python scripts/07a_fp_input.py --check", depends-on = ["validate-energy"] }
+parity = { cmd = "python scripts/08a_smarts_parity.py && node scripts/08b_smarts_parity.mjs && python scripts/08a_smarts_parity.py --compare", depends-on = ["fingerprints"] }
+site-data = { cmd = "python scripts/09_build_site_data.py", depends-on = ["parity"] }
+# Full offline rebuild: extract -> label -> geometry -> validate-energy -> fingerprints -> parity -> site-data
+process = { depends-on = ["site-data"] }
+# Tests
+test-py = "pytest -q tests"
+test-js = { cmd = "python scripts/10_test_fixtures.py && node --test tests/js/", depends-on = ["test-py"] }
+test-e2e = { cmd = "node tests/e2e/smoke.mjs chromium firefox webkit", depends-on = ["test-js"] }
+test = { depends-on = ["test-e2e"] }
+serve = "node tests/e2e/serve.mjs 8000"

@@ -1,0 +1,12 @@
+{
+  "name": "sage-training-explorer-build",
+  "private": true,
+  "description": "Node build/validation scripts. The same RDKit.js bytes are vendored into docs/vendor/rdkit/.",
+  "dependencies": {
+    "@rdkit/rdkit": "2026.3.6",
+    "ngl": "^2.5.0"
+  },
+  "devDependencies": {
+    "playwright": "^1.63.0"
+  }
+}

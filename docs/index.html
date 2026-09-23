@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Sage Training Explorer</title>
+    <meta name="description" content="Compare SMARTS patterns and molecules with the OpenFF Sage 2.3.0 training set, and each valence parameter with the QM geometries it was trained on. Runs entirely in the browser with RDKit.js." />
+    <link rel="stylesheet" href="css/style.css" />
+    <script>
+      try {
+        const t = localStorage.getItem("theme");
+        if (t) document.documentElement.dataset.theme = t;
+      } catch (e) {}
+    </script>
+  </head>
+  <body>
+    <header class="top">
+      <div class="wrap">
+        <h1>Sage 2.3.0 training-set explorer</h1>
+        <span class="sub" id="subtitle">Loading…</span>
+        <button class="theme-toggle" id="theme-toggle" type="button" aria-label="Toggle dark mode">Theme</button>
+        <nav class="tabs" aria-label="Sections">
+          <a href="#params" data-tab="params">Parameters</a>
+          <a href="#smarts" data-tab="smarts">SMARTS search</a>
+          <a href="#molecule" data-tab="molecule">Molecule search</a>
+          <a href="#about" data-tab="about">About &amp; methods</a>
+        </nav>
+      </div>
+    </header>
+    <main class="wrap" id="main">
+      <p class="muted">Loading data…</p>
+    </main>
+    <script type="module" src="js/app.js"></script>
+  </body>
+</html>

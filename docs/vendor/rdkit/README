@@ -1,0 +1,3 @@
+RDKit.js (@rdkit/rdkit 2026.3.6, npm), vendored unmodified.
+License: BSD-3-Clause, text from https://github.com/rdkit/rdkit/blob/Release_2026_03_6/license.txt
+Hashes: SHA256SUMS (checked by scripts/js/rdkit.mjs before every build/test use).

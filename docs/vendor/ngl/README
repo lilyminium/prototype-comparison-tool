@@ -1,0 +1,2 @@
+NGL Viewer (npm ngl 2.5.0), vendored unmodified (dist/ngl.js, UMD; exposes global NGL). License: MIT (LICENSE).
+nglview is the Jupyter wrapper around this library.

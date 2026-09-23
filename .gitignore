@@ -1,0 +1,13 @@
+data/raw/
+data/processed/
+logs/
+.pixi/
+node_modules/
+__pycache__/
+tests/js/fixtures.json
+.DS_Store
+
+PLAN.md
+PLAN_precompute.md
+HANDOVER.md
+STATUS.md
