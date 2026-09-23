@@ -1,20 +1,8 @@
 // Sage 2.3.0 training-set explorer: UI. Data layout: docs/data/SCHEMA.md. Everything runs client-side.
 import { histogramChart, lineChart, scanChart } from "./charts.js";
 import { openViewer } from "./viewer3d.js";
-import { FLAG_IS_DRIVEN_TORSION, TORSION_HANDLERS, conformerCoords, fetchBuffer, fetchJSON, parseAssignments, parseShard } from "./data.js";
-import {
-  classifyMeasurement,
-  extent,
-  measureTopology,
-  drivenScans,
-  fourierProfile,
-  histogram,
-  measure,
-  observations,
-  tanimotoAll,
-  weightedCircularStats,
-  weightedLinearStats,
-} from "./stats.js";
+import { depiction, fetchBuffer, fetchJSON, moleculeSvg, parseAssignments, parseGeometry } from "./data.js";
+import { classifyMeasurement, extent, histogram, tanimotoAll, universeKey, weightedCircularStats, weightedLinearStats } from "./stats.js";
 
 const DATA = "data/";
 const HANDLER_LABEL = { Bonds: "Bond", Angles: "Angle", ProperTorsions: "Proper torsion", ImproperTorsions: "Improper torsion" };
@@ -107,6 +95,32 @@ function molCard(caption, svgPromise, view3d = null) {
     .catch((e) => (box.textContent = e.message));
   return box;
 }
+/**
+ * Render a record's PRECOMPUTED depiction with highlights. Highlight indices come from precomputed maps:
+ * the heavy-only drawing (via heavy_index) unless a highlighted atom is a hydrogen, in which case the
+ * explicit-H drawing (atom order = topology order). `atoms`: one interaction (bonds between consecutive
+ * atoms, or the improper star); `matches`: SMARTS matches (all their atoms and every bond between them).
+ */
+async function renderTopology(t, { atoms = [], improper = false, matches = null }) {
+  const dep = await depiction(DATA, t);
+  const all = matches ? [...new Set(matches.flat())] : atoms;
+  const heavy = all.every((a) => dep.heavy_index[a] >= 0);
+  const idx = heavy ? (a) => dep.heavy_index[a] : (a) => a;
+  const bondList = heavy ? dep.bonds_heavy : dep.bonds_h;
+  const pairKey = (a, b) => (a < b ? `${a},${b}` : `${b},${a}`);
+  const bondIndex = new Map(bondList.map(([a, b], i) => [pairKey(a, b), i]));
+  let bonds;
+  if (matches) {
+    const inSet = new Set(all.map(idx));
+    bonds = bondList.map(([a, b], i) => (inSet.has(a) && inSet.has(b) ? i : -1)).filter((i) => i >= 0);
+  } else {
+    const d = atoms.map(idx);
+    const pairs = improper && d.length === 4 ? [[d[1], d[0]], [d[1], d[2]], [d[1], d[3]]] : d.slice(1).map((b, i) => [d[i], b]);
+    bonds = pairs.map(([a, b]) => bondIndex.get(pairKey(a, b))).filter((i) => i !== undefined);
+  }
+  return rdkit("render", { molblock: heavy ? dep.molblock_heavy : dep.molblock_h, atoms: all.map(idx), bonds });
+}
+
 /** Topology to show in 3D for a molecule: its first optimization record, else its first TorsionDrive. */
 function representativeTopology(mol_idx) {
   const tops = state.molecules.topologies[mol_idx];
@@ -255,35 +269,38 @@ function renderParams() {
 }
 
 // ---------------------------------------------------------------- Parameter detail
+// Everything on this page is precomputed by scripts/09_build_site_data.py (param/<id>.json): histograms and
+// statistics for both weightings, the torsion energy profile and its minima, driven scans, examples.
 async function renderParam(id) {
   const p = state.params.find((x) => x.param_id === id);
   if (!p) {
     main.append(h("p", {}, `Unknown parameter ${id}`));
     return;
   }
-  const isTorsion = TORSION_HANDLERS.has(p.handler);
+  const isTorsion = p.handler === "ProperTorsions" || p.handler === "ImproperTorsions";
   const unit = UNIT[p.handler];
-  const head = h(
-    "section",
-    { class: "card" },
-    h("p", {}, h("a", { href: "#params" }, "← All parameters")),
-    h("h2", {}, `${p.param_id} · ${HANDLER_LABEL[p.handler]}`),
-    h("p", {}, h("code", {}, p.smirks)),
+  main.append(
     h(
-      "div",
-      { class: "stats" },
-      p.handler === "Bonds" ? [stat("Sage 2.3.0 r₀", `${fmt(p.length_angstrom, 4)} Å`), stat("Sage 2.3.0 k", `${fmt(p.k, 2)} kcal/mol/Å²`)] : null,
-      p.handler === "Angles" ? [stat("Sage 2.3.0 θ₀", `${fmt(p.angle_deg, 3)}°`), stat("Sage 2.3.0 k", `${fmt(p.k, 2)} kcal/mol/rad²`)] : null,
-      isTorsion ? p.periodicity.map((n, i) => stat(`term ${i + 1}: n=${n}, phase ${p.phase_deg[i]}°`, `k ${fmt(p.k_raw[i], 4)} / idivf ${p.idivf[i]}`)) : null,
-      stat("molecules", p.n_molecules),
-      stat("assignments", p.n_assignments),
-      stat("opt / TD observations", `${p.n_obs_opt} / ${p.n_obs_td}`),
-      isTorsion ? stat("undefined (near-linear)", p.n_invalid) : null,
+      "section",
+      { class: "card" },
+      h("p", {}, h("a", { href: "#params" }, "← All parameters")),
+      h("h2", {}, `${p.param_id} · ${HANDLER_LABEL[p.handler]}`),
+      h("p", {}, h("code", {}, p.smirks)),
+      h(
+        "div",
+        { class: "stats" },
+        p.handler === "Bonds" ? [stat("Sage 2.3.0 r₀", `${fmt(p.length_angstrom, 4)} Å`), stat("Sage 2.3.0 k", `${fmt(p.k, 2)} kcal/mol/Å²`)] : null,
+        p.handler === "Angles" ? [stat("Sage 2.3.0 θ₀", `${fmt(p.angle_deg, 3)}°`), stat("Sage 2.3.0 k", `${fmt(p.k, 2)} kcal/mol/rad²`)] : null,
+        isTorsion ? p.periodicity.map((n, i) => stat(`term ${i + 1}: n=${n}, phase ${p.phase_deg[i]}°`, `k ${fmt(p.k_raw[i], 4)} / idivf ${p.idivf[i]}`)) : null,
+        stat("molecules", p.n_molecules),
+        stat("assignments", p.n_assignments),
+        stat("opt / TD observations", `${p.n_obs_opt} / ${p.n_obs_td}`),
+        isTorsion ? stat("undefined (near-linear)", p.n_invalid) : null,
+      ),
+      h("p", {}, h("a", { href: `#smarts/${encodeURIComponent(p.smirks)}` }, "Search the training set with this SMIRKS →")),
     ),
-    h("p", {}, h("a", { href: `#smarts/${encodeURIComponent(p.smirks)}` }, "Search the training set with this SMIRKS →")),
   );
-  main.append(head);
-  if (!p.shard) {
+  if (!p.detail) {
     main.append(h("section", { class: "card" }, h("p", { class: "note" }, "This parameter is not assigned to any atom in the training set (zero coverage), so there is no QM distribution to show.")));
     return;
   }
@@ -294,63 +311,50 @@ async function renderParam(id) {
   const statsBox = h("div", { class: "stats" });
   const chartBox = h("div", { class: "chart-box" });
   const extraBox = h("div", { class: "chart-box" });
-  const dist = h(
-    "section",
-    { class: "card" },
-    h("h3", {}, isTorsion ? "QM dihedral distribution (optimization minima)" : `QM ${p.handler === "Bonds" ? "bond length" : "angle"} distribution (optimization minima)`),
-    h("div", { class: "row" }, weighting),
+  main.append(
     h(
-      "p",
-      { class: "muted" },
-      isTorsion
-        ? "Dihedrals are measured in the atom order label_molecules assigns (IUPAC sign convention, as OpenMM). Undefined (near-linear) dihedrals and torsions about the frozen bonds of the 13 constrained optimizations are excluded. "
-        : `The dashed line is the Sage 2.3.0 equilibrium value (${p.handler === "Bonds" ? "r₀" : "θ₀"}). QM − ${p.handler === "Bonds" ? "r₀" : "θ₀"} is descriptive, not a force-field error: the MM minimum also depends on the other bonded and nonbonded terms. `,
-      "TorsionDrive grid points are not included here.",
+      "section",
+      { class: "card" },
+      h("h3", {}, isTorsion ? "QM dihedral distribution (optimization minima)" : `QM ${p.handler === "Bonds" ? "bond length" : "angle"} distribution (optimization minima)`),
+      h("div", { class: "row" }, weighting),
+      h(
+        "p",
+        { class: "muted" },
+        isTorsion
+          ? "Dihedrals are measured in the atom order label_molecules assigns (IUPAC sign convention, as OpenMM). Undefined (near-linear) dihedrals and torsions about the frozen bonds of the 13 constrained optimizations are excluded. "
+          : `The dashed line is the Sage 2.3.0 equilibrium value (${p.handler === "Bonds" ? "r₀" : "θ₀"}). QM − ${p.handler === "Bonds" ? "r₀" : "θ₀"} is descriptive, not a force-field error: the MM minimum also depends on the other bonded and nonbonded terms. `,
+        "TorsionDrive grid points are not included here.",
+      ),
+      chartBox,
+      statsBox,
+      extraBox,
     ),
-    chartBox,
-    statsBox,
-    extraBox,
   );
-  main.append(dist);
-
-  const [buf] = await Promise.all([fetchBuffer(DATA + p.shard)]);
-  const shard = parseShard(buf, p.handler);
+  const detail = await fetchJSON(DATA + p.detail);
 
   function draw() {
-    const obs = observations(shard, p, state.topologies, { series: ["opt"], weighting: weighting.value });
+    const w = detail.weightings[weighting.value];
     statsBox.innerHTML = "";
-    if (!obs.value.length) {
+    if (!w.n_obs) {
       chartBox.innerHTML = `<p class="note">No optimization-minimum observations for this parameter${p.n_obs_td ? "; it occurs only in TorsionDrive records (see the training molecules below)" : ""}.</p>`;
       return;
-    }
-    let lo, hi, nb;
-    if (isTorsion) [lo, hi, nb] = [-180, 180, 72];
-    else {
-      let mn = Infinity, mx = -Infinity;
-      for (const v of obs.value) (mn = Math.min(mn, v)), (mx = Math.max(mx, v));
-      const centre = p.handler === "Bonds" ? p.length_angstrom : p.angle_deg;
-      mn = Math.min(mn, centre);
-      mx = Math.max(mx, centre);
-      const pad = (mx - mn) * 0.05 || (p.handler === "Bonds" ? 0.01 : 1);
-      [lo, hi, nb] = [mn - pad, mx + pad, 60];
     }
     const refLines = isTorsion
       ? []
       : [p.handler === "Bonds" ? { x: p.length_angstrom, label: `Sage 2.3.0 r₀ = ${fmt(p.length_angstrom, 4)} Å` } : { x: p.angle_deg, label: `Sage 2.3.0 θ₀ = ${fmt(p.angle_deg, 2)}°` }];
     histogramChart(chartBox, {
-      series: [{ name: "Optimization minima", slot: 1, hist: histogram(obs.value, obs.weight, lo, hi, nb) }],
+      series: [{ name: "Optimization minima", slot: 1, hist: { lo: w.lo, hi: w.hi, width: (w.hi - w.lo) / w.nb, counts: w.counts } }],
       xLabel: isTorsion ? "dihedral (°)" : p.handler === "Bonds" ? "bond length (Å)" : "angle (°)",
       yLabel: weighting.value === "molecule" ? "molecule-weighted count" : p.handler === "ImproperTorsions" ? "count (each improper = 1)" : "count",
       refLines,
       xTicks: isTorsion ? [-180, -120, -60, 0, 60, 120, 180] : undefined,
     });
-    statsBox.append(stat("molecules", new Set(obs.mol).size), stat("observations", p.handler === "ImproperTorsions" ? `${obs.value.length / 3} impropers` : obs.value.length));
+    statsBox.append(stat("molecules", w.n_mol), stat("observations", p.handler === "ImproperTorsions" ? `${w.n_obs / 3} impropers` : w.n_obs));
+    const st = w.stats;
     if (isTorsion) {
-      const c = weightedCircularStats(obs.value, obs.weight);
       // For multimodal torsions the circular mean is not a typical value; R shows how concentrated it is
-      statsBox.append(stat("circular mean", `${fmt(c.circMean, 1)}°`), stat("mean resultant length R", fmt(c.resultantLength, 3)), stat("circular SD", c.circStd === null ? "–" : `${fmt(c.circStd, 1)}°`));
+      statsBox.append(stat("circular mean", `${fmt(st.circMean, 1)}°`), stat("mean resultant length R", fmt(st.resultantLength, 3)), stat("circular SD", st.circStd === null ? "–" : `${fmt(st.circStd, 1)}°`));
     } else {
-      const st = weightedLinearStats(obs.value, obs.weight);
       const centre = p.handler === "Bonds" ? p.length_angstrom : p.angle_deg;
       const d = p.handler === "Bonds" ? 4 : 2;
       statsBox.append(
@@ -366,7 +370,8 @@ async function renderParam(id) {
   draw();
 
   if (isTorsion) {
-    const prof = fourierProfile(p, 1);
+    const prof = detail.profile;
+    const x = prof.y.map((_, i) => prof.x0 + i * prof.step);
     const profBox = h("div", { class: "chart-box" });
     extraBox.append(
       h("h3", {}, p.handler === "ImproperTorsions" ? "Single-term functional form (illustration)" : "Force-field torsion energy profile"),
@@ -379,42 +384,31 @@ async function renderParam(id) {
       ),
       profBox,
     );
-    lineChart(profBox, { x: prof.x, y: prof.y, xLabel: "dihedral (°)", yLabel: "energy (kcal/mol)", markers: prof.minima.map((m) => ({ x: m.phi, y: m.energy })), xTicks: [-180, -120, -60, 0, 60, 120, 180], yUnit: "kcal/mol" });
-    const scans = drivenScans(shard, state.topologies);
-    if (scans.length) await renderScans(extraBox, p, shard, scans);
+    lineChart(profBox, { x, y: prof.y, xLabel: "dihedral (°)", yLabel: "energy (kcal/mol)", markers: prof.minima.map((m) => ({ x: m.phi, y: m.energy })), xTicks: [-180, -120, -60, 0, 60, 120, 180], yUnit: "kcal/mol" });
+    if (detail.scans.length) renderScans(extraBox, p, detail.scans);
   }
-  await renderExamples(p, shard);
+  renderExamples(p, detail.examples);
 }
 
-async function renderScans(box, p, shard, scans) {
-  const conformers = await fetchJSON(DATA + "conformers.json");
+function renderScans(box, p, scans) {
   const T = state.topologies;
-  const select = h("select", {}, ...scans.map((s, i) => h("option", { value: i }, `${state.molecules.display_smiles[T.mol_idx[s.topology]]} (TD ${T.record_id[s.topology]})`)));
+  const select = h("select", {}, ...scans.map((s, i) => h("option", { value: i }, `${state.molecules.display_smiles[T.mol_idx[s.t]]} (TD ${T.record_id[s.t]})`)));
   const chart = h("div", { class: "chart-box" });
   const pic = h("div", { class: "mols" });
   box.append(h("h3", {}, `TorsionDrive scans driving this torsion (${scans.length})`), h("p", { class: "muted" }, "QM relative energy of each constrained optimization along the driven dihedral. Use “3D scan + energy” to animate the scan in 3D alongside this profile."), select, chart, pic);
   const draw = () => {
     const s = scans[select.value];
-    const t = s.topology;
-    const start = T.conf_start[t];
-    const pts = [];
-    for (let j = 0; j < T.n_conf[t]; j++) pts.push({ x: conformers.grid_deg[start + j], y: conformers.rel_energy_kcal[start + j] });
-    scanChart(chart, { points: pts, xLabel: "driven dihedral, grid angle (°)", yLabel: "relative QM energy (kcal/mol)" });
-    const atoms = Array.from(shard.atoms.slice(4 * s.asg, 4 * s.asg + 4));
+    scanChart(chart, { points: s.frames.map(([grid, energy]) => ({ x: grid, y: energy })), xLabel: "driven dihedral, grid angle (°)", yLabel: "relative QM energy (kcal/mol)" });
     pic.innerHTML = "";
-    pic.append(molCard(topologyCaption(t), rdkit("topologySvg", { t, highlight: atoms, improper: false }), { t, highlight: atoms, label: `${p.param_id} atoms ${atoms.join("-")}` }));
+    pic.append(molCard(topologyCaption(s.t), renderTopology(s.t, { atoms: s.atoms }), { t: s.t, highlight: s.atoms, label: `${p.param_id} atoms ${s.atoms.join("-")}` }));
   };
   select.addEventListener("change", draw);
   draw();
 }
 
-async function renderExamples(p, shard) {
-  const T = state.topologies;
-  // One example assignment per record (topology); optimization and TorsionDrive records filtered separately
-  const firstAsg = new Map();
-  for (let i = 0; i < shard.nAsg; i++) if (!firstAsg.has(shard.topology[i])) firstAsg.set(shard.topology[i], i);
-  const bySource = { opt: [], td: [] };
-  for (const [t, i] of firstAsg) bySource[T.source[t]].push(i);
+function renderExamples(p, examples) {
+  // One example assignment per record, precomputed; optimization and TorsionDrive records filtered separately
+  const bySource = { opt: examples.filter((e) => e[2] === "opt"), td: examples.filter((e) => e[2] === "td") };
   const optBox = h("input", { type: "checkbox", checked: bySource.opt.length > 0 });
   const tdBox = h("input", { type: "checkbox", checked: bySource.opt.length === 0 });
   const grid = h("div", { class: "mols" });
@@ -439,25 +433,17 @@ async function renderExamples(p, shard) {
   const per = 12;
   const selected = () => [...(optBox.checked ? bySource.opt : []), ...(tdBox.checked ? bySource.td : [])];
   const draw = () => {
-    const examples = selected();
+    const list = selected();
     grid.innerHTML = "";
-    if (!examples.length) grid.append(h("p", { class: "muted" }, "Select optimizations and/or TorsionDrives."));
-    for (const i of examples.slice(page * per, page * per + per)) {
-      const t = shard.topology[i];
-      const atoms = Array.from(shard.atoms.slice(4 * i, 4 * i + 4)).filter((a) => a >= 0);
-      grid.append(
-        molCard(topologyCaption(t, `atoms ${atoms.join("-")}`), rdkit("topologySvg", { t, highlight: atoms, improper: p.handler === "ImproperTorsions" }), {
-          t,
-          highlight: atoms,
-          label: `${p.param_id} atoms ${atoms.join("-")}`,
-        }),
-      );
+    if (!list.length) grid.append(h("p", { class: "muted" }, "Select optimizations and/or TorsionDrives."));
+    for (const [t, atoms] of list.slice(page * per, page * per + per)) {
+      grid.append(molCard(topologyCaption(t, `atoms ${atoms.join("-")}`), renderTopology(t, { atoms, improper: p.handler === "ImproperTorsions" }), { t, highlight: atoms, label: `${p.param_id} atoms ${atoms.join("-")}` }));
     }
     pager.innerHTML = "";
-    const pages = Math.max(1, Math.ceil(examples.length / per));
+    const pages = Math.max(1, Math.ceil(list.length / per));
     pager.append(
       h("button", { type: "button", disabled: page === 0, onclick: () => (page--, draw()) }, "Previous"),
-      h("span", { class: "muted" }, `page ${page + 1} of ${pages} · ${examples.length} records`),
+      h("span", { class: "muted" }, `page ${page + 1} of ${pages} · ${list.length} records`),
       h("button", { type: "button", disabled: page + 1 >= pages, onclick: () => (page++, draw()) }, "Next"),
     );
   };
@@ -598,7 +584,7 @@ function renderSmartsRecords(box, r, hits, tuplesOf) {
       const matches = tuplesOf(k);
       const all = [...new Set(matches.flat())];
       grid.append(
-        molCard(topologyCaption(t, `${matches.length} match(es)`), rdkit("topologySvg", { t, matches, improper }), { t, highlight: all, label: `${matches.length} match(es)` }),
+        molCard(topologyCaption(t, `${matches.length} match(es)`), renderTopology(t, { matches, improper }), { t, highlight: all, label: `${matches.length} match(es)` }),
       );
     }
     pager.innerHTML = "";
@@ -614,40 +600,46 @@ function renderSmartsRecords(box, r, hits, tuplesOf) {
 }
 
 async function smartsGeometry(card, kind, hits, tuplesOf, current) {
+  // Every bond, angle, proper chain and improper star of every optimization record, with its value(s),
+  // validity, frozen-bond flag and Sage parameter, is precomputed (scripts/05b_geometry_universe.py).
+  // Here matched tuples are only turned into canonical keys and looked up; no geometry is computed.
   const T = state.topologies;
   const handler = MEASURE_HANDLER[kind];
   card.append(h("h3", {}, `QM ${kind === "bond" ? "bond length" : kind === "angle" ? "angle" : kind + " dihedral"} of the mapped atoms (optimization minima)`));
-  const note = h("p", { class: "muted" }, "Loading coordinates…");
+  const note = h("p", { class: "muted" }, "Loading precomputed geometry…");
   card.append(note);
-  const [coordsBuf, asgBuf] = await Promise.all([fetchBuffer(DATA + "coords_opt.bin"), fetchBuffer(DATA + "assignments.bin")]);
+  const geometry = parseGeometry(await fetchBuffer(DATA + "geom_opt.bin"));
   if (!current()) return;
-  const coords = new Float32Array(coordsBuf);
-  const asg = parseAssignments(asgBuf);
   const values = [], weights = [];
   const paramCounts = new Map();
   let nInvalid = 0, nConstrained = 0;
   const optHits = hits.map((t, k) => [t, k]).filter(([t]) => T.source[t] === "opt");
   for (let n = 0; n < optHits.length; n++) {
-    if (n % 200 === 0) {
-      note.textContent = `Measuring… ${n} / ${optHits.length} records`;
+    if (n % 500 === 0) {
+      note.textContent = `Looking up… ${n} / ${optHits.length} records`;
       await yieldToBrowser();
       if (!current()) return;
     }
     const [t, k] = optHits[n];
-    const m = measureTopology(kind, T, t, tuplesOf(k), coords);
-    nInvalid += m.nInvalid;
-    nConstrained += m.nConstrained;
-    for (let i = 0; i < m.values.length; i++) (values.push(m.values[i]), weights.push(m.weights[i]));
-    // Which Sage parameter covers each measured interaction (from the precomputed label_molecules assignments)
-    const x0 = conformerCoords(coords, T, t, 0);
-    const assigned = new Map();
-    for (const a of asg.forTopology(t)) {
-      const p = state.params[a.paramIndex];
-      if (p.handler === handler) assigned.set(measure(kind, x0, a.atoms).key, p.param_id);
-    }
-    for (const key of m.keys) {
-      const pid = assigned.get(key) || "(unassigned)";
+    const table = geometry.lookup(kind, t);
+    const seen = new Set();
+    for (const tup of tuplesOf(k)) {
+      const key = universeKey(kind, tup);
+      if (seen.has(key)) continue; // reverse / permuted matches of the same interaction
+      seen.add(key);
+      const row = table.get(key);
+      if (!row) throw new Error(`no precomputed ${kind} ${key} in record ${T.record_id[t]}`);
+      if (row.frozen) {
+        nConstrained++;
+        continue;
+      }
+      const pid = row.param >= 0 ? state.params[row.param].param_id : "(no Sage parameter)";
       paramCounts.set(pid, (paramCounts.get(pid) || 0) + 1);
+      if (!row.valid) {
+        nInvalid++;
+        continue;
+      }
+      for (const v of row.values) (values.push(v), weights.push(1 / row.values.length));
     }
   }
   note.remove();
@@ -685,7 +677,7 @@ async function smartsGeometry(card, kind, hits, tuplesOf, current) {
   const rows = [...paramCounts.entries()].sort((a, b) => b[1] - a[1]);
   card.append(
     h("h3", {}, `Sage ${HANDLER_LABEL[handler].toLowerCase()} parameters on these atoms`),
-    h("p", { class: "muted" }, "From the precomputed label_molecules assignments (exact), counted per matched interaction in the optimization records."),
+    h("p", { class: "muted" }, "From the precomputed label_molecules assignments (exact), counted per matched interaction in the optimization records. Improper stars with no Sage improper are listed as “(no Sage parameter)”."),
     h(
       "div",
       { class: "table-wrap" },
@@ -730,9 +722,16 @@ async function renderMolecule(initial) {
     }
     out.innerHTML = "<p class='muted'>Comparing… (the first search parses all training molecules, a few seconds)</p>";
     try {
-      const [r, fpBuf] = await Promise.all([rdkit("molecule", { smiles: input.value.trim() }), fetchBuffer(DATA + "fp_morgan.bin")]);
+      const [r, fpBuf, popBuf, canonical] = await Promise.all([
+        rdkit("molecule", { smiles: input.value.trim() }),
+        fetchBuffer(DATA + "fp_morgan.bin"),
+        fetchBuffer(DATA + "fp_popcount.bin"),
+        fetchJSON(DATA + "canonical_smiles.json"),
+      ]);
+      // exact match: the query's RDKit.js canonical SMILES vs the precomputed dataset canonical SMILES
+      r.exact = canonical.flatMap((c, m) => (c === r.canonical ? [m] : []));
       out.innerHTML = "";
-      await showMoleculeResults(out, r, new Uint8Array(fpBuf));
+      await showMoleculeResults(out, r, new Uint8Array(fpBuf), new Uint16Array(popBuf));
     } catch (e) {
       out.innerHTML = `<p class="error">${esc(e.message)}</p>`;
     }
@@ -742,7 +741,7 @@ async function renderMolecule(initial) {
   if (initial) go();
 }
 
-async function showMoleculeResults(out, r, fps) {
+async function showMoleculeResults(out, r, fps, popcounts) {
   const M = state.molecules, T = state.topologies;
   const query = h("div", { class: "mol", style: "max-width:380px" });
   query.innerHTML = r.svg;
@@ -781,16 +780,16 @@ async function showMoleculeResults(out, r, fps) {
     out.append(h("section", { class: "card" }, h("p", {}, "Not in the training set (exact match on canonical isomeric SMILES).")));
   }
 
-  const sim = tanimotoAll(r.fp, fps);
+  const sim = tanimotoAll(r.fp, fps, popcounts);
   const order = Array.from(sim.keys()).sort((a, b) => sim[b] - sim[a]).slice(0, 24);
   const simGrid = h("div", { class: "mols" });
   out.append(h("section", { class: "card" }, h("h3", {}, "Most similar training molecules"), simGrid));
-  for (const m of order) simGrid.append(molCard(h("div", { class: "cap" }, `Tanimoto ${sim[m].toFixed(3)}`, h("br"), h("span", { class: "mono" }, M.display_smiles[m])), rdkit("moleculeSvg", { mol_idx: m }), { t: representativeTopology(m) }));
+  for (const m of order) simGrid.append(molCard(h("div", { class: "cap" }, `Tanimoto ${sim[m].toFixed(3)}`, h("br"), h("span", { class: "mono" }, M.display_smiles[m])), moleculeSvg(DATA, m), { t: representativeTopology(m) }));
 
   const sub = r.substructure;
   const subGrid = h("div", { class: "mols" });
   out.append(h("section", { class: "card" }, h("h3", {}, `Training molecules containing the query as a substructure (${sub.length})`), sub.length > 24 ? h("p", { class: "muted" }, "Showing 24.") : null, subGrid));
-  for (const m of sub.slice(0, 24)) subGrid.append(molCard(h("div", { class: "cap mono" }, M.display_smiles[m]), rdkit("moleculeSvg", { mol_idx: m }), { t: representativeTopology(m) }));
+  for (const m of sub.slice(0, 24)) subGrid.append(molCard(h("div", { class: "cap mono" }, M.display_smiles[m]), moleculeSvg(DATA, m), { t: representativeTopology(m) }));
 }
 
 // ---------------------------------------------------------------- About

@@ -117,7 +117,15 @@ for (const name of browsers.length ? browsers : ["chromium"]) {
     await step("molecule", async () => {
       await page.goto(base + "#molecule/" + encodeURIComponent("CC(=O)Nc1ccc(O)cc1"));
       await page.waitForSelector("text=Most similar training molecules", { timeout: 120000 });
-      await page.waitForSelector(".mol svg", { timeout: 60000 });
+      // every card (query + pre-rendered similarity/substructure SVGs) must be drawn, not just the first
+      await page.waitForFunction(
+        () => {
+          const cards = [...document.querySelectorAll(".mol")];
+          return cards.length > 1 && cards.every((c) => c.querySelector("svg"));
+        },
+        null,
+        { timeout: 60000 },
+      );
     });
     await step("opt-conformers-3d", async () => {
       // a molecule with three optimization records: conformer checkboxes, no playback controls

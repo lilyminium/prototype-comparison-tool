@@ -11,8 +11,13 @@ Files (all little-endian; JSON files use column arrays to stay small):
   coords_opt.bin       Float32 xyz (Å) of optimization conformers (lazy, SMARTS geometry / viewer)
   coords_td.bin        Float32 xyz (Å) of TorsionDrive grid points (lazy, opt-in)
   fp_morgan.bin        Uint8, 256 bytes per molecule (Morgan r=2, 2048 bits; vendored RDKit.js)
-  shards/<param>.bin   per-parameter observations (lazy, one file per parameter)
+  fp_popcount.bin      Uint16 set bits per molecule; canonical_smiles.json: RDKit.js canonical SMILES
   assignments.bin      per-topology parameter assignments (lazy): which parameter covers which atoms
+  param/<param>.json   everything a parameter page shows: histograms, statistics, profile, examples, scans (lazy)
+  geom_opt.bin         every bond/angle/proper/improper of every optimization record, with values (lazy)
+  depictions/<k>.json  precomputed 2D molblocks per record; molecule_svgs/<k>.json: pre-rendered SVGs (lazy)
+  conformer_groups.json  superposed optimization conformers of the same molecule (lazy)
+Per-parameter observation shards are written to data/processed/shards/ (tests only; not served).
 
 Size gates (build fails if exceeded): total ≤ 60 MB compressed (gzip -6, as a proxy for HTTP
 compression); initial load ≤ 5 MB compressed excluding RDKit.js; any single file ≤ 10 MB compressed.
@@ -28,6 +33,7 @@ import struct
 
 import numpy as np
 import pandas as pd
+import sitelib
 
 SCHEMA_VERSION = 1
 HANDLER_CODE = {"Bonds": 0, "Angles": 1, "ProperTorsions": 2, "ImproperTorsions": 3}
@@ -78,6 +84,13 @@ def linear_stats(x: np.ndarray, w: np.ndarray) -> dict:
     }
 
 
+def bond_pairs(molblock: str) -> list[list[int]]:
+    from rdkit import Chem
+
+    m = Chem.MolFromMolBlock(molblock, removeHs=False, sanitize=False)
+    return [[b.GetBeginAtomIdx(), b.GetEndAtomIdx()] for b in m.GetBonds()]
+
+
 def write_json(path: pathlib.Path, obj) -> None:
     path.write_text(json.dumps(obj, separators=(",", ":"), allow_nan=False))
 
@@ -106,7 +119,7 @@ def main() -> None:
     out = final.parent / (final.name + ".staging")
     if out.exists():
         shutil.rmtree(out)  # leftover from an interrupted build of this script
-    (out / "shards").mkdir(parents=True)
+    out.mkdir(parents=True)
     for name in KEEP:
         if (final / name).exists():
             shutil.copy2(final / name, out / name)
@@ -158,6 +171,7 @@ def main() -> None:
     specs = sorted(conformers.spec.unique())
     spec_idx = {s: i for i, s in enumerate(specs)}
     grid = conformers.grid_key.map(lambda k: None if pd.isna(k) else json.loads(k)[0])
+    grid_by_conf = [None if pd.isna(g) else int(g) for g in grid]
 
     # QM energies of optimization records. For molecules with several optimization records (conformers),
     # the energy relative to the lowest of them, only when all share the same QC level (program, method,
@@ -228,6 +242,11 @@ def main() -> None:
             ],
             "frozen": [cons.get((i, "frozen"), []) for i in topologies.topology_idx],
             "unassigned_propers": [unas.get(i, []) for i in topologies.topology_idx],
+            # TorsionDrive records: conformer offsets in ascending grid-angle order (3D animation frames)
+            "frame_order": [
+                [int(j) for j in np.argsort([grid_by_conf[c0 + j] for j in range(n)], kind="stable")] if src == "td" else None
+                for src, c0, n in zip(topologies.source, topologies.conf_start, topologies.n_conf)
+            ],
         },
     )
 
@@ -269,6 +288,9 @@ def main() -> None:
 
     source_of = topologies.source.to_numpy()
     n_conf_of = topologies.n_conf.to_numpy()
+    mol_of = topologies.mol_idx.to_numpy()
+    rel_by_conf = [None if pd.isna(e) else round(float(e), 6) for e in conformers.rel_energy_kcal]  # as conformers.json
+    (out / "param").mkdir()
     values = values.sort_values(["asg_idx", "conf_idx"]).reset_index(drop=True)
     values_by_param = dict(
         tuple(
@@ -298,7 +320,7 @@ def main() -> None:
                 "n_assignments": 0,
                 "n_obs_opt": 0,
                 "n_obs_td": 0,
-                "shard": None,
+                "detail": None,
             }
             param_rows.append(row)
             continue
@@ -338,8 +360,43 @@ def main() -> None:
         buf += v.tobytes()
         if is_torsion:
             buf += valid.tobytes()
-        shard = f"shards/{r.param_id}.bin"
-        (out / shard).write_bytes(bytes(buf))
+        # Shards are no longer served; kept under data/processed for the tests
+        (p / "shards").mkdir(exist_ok=True)
+        (p / "shards" / f"{r.param_id}.bin").write_bytes(bytes(buf))
+
+        # Everything the parameter page shows, precomputed (PLAN_precompute.md; sitelib = former browser code)
+        centre_value = None if is_torsion else (row["length_angstrom"] if r.handler == "Bonds" else row["angle_deg"])
+        detail = {"param_id": r.param_id, "weightings": {}}
+        for weighting in ("instances", "molecule"):
+            ov, ow, om = sitelib.observations(v.ravel(), width, valid if is_torsion else None, t_idx, flags, n_conf_of, source_of, mol_of, weighting)
+            if not len(ov):
+                detail["weightings"][weighting] = {"n_obs": 0}
+                continue
+            lo, hi, nb = sitelib.bins(r.handler, ov, centre_value)
+            detail["weightings"][weighting] = {
+                "n_obs": int(len(ov)),
+                "n_mol": int(len(set(om.tolist()))),
+                "lo": lo,
+                "hi": hi,
+                "nb": nb,
+                "counts": sitelib.histogram(ov, ow, lo, hi, nb),
+                "stats": sitelib.circular_stats(ov, ow) if is_torsion else sitelib.linear_stats(ov, ow),
+            }
+        if is_torsion:
+            detail["profile"] = sitelib.fourier_profile(row["periodicity"], row["phase_deg"], row["k_effective"])
+        first = {}
+        for i, t in enumerate(t_idx):
+            first.setdefault(int(t), i)
+        detail["examples"] = [[t, [int(x) for x in atoms[i] if x >= 0], str(source_of[t])] for t, i in first.items()]
+        if is_torsion:
+            scans = []
+            for i in np.flatnonzero(flags & FLAG_IS_DRIVEN_TORSION):
+                t = int(t_idx[i])
+                c0 = int(topologies.at[t, "conf_start"])
+                frames = sorted((grid_by_conf[c0 + j], rel_by_conf[c0 + j], c0 + j) for j in range(int(n_conf_of[t])))
+                scans.append({"t": t, "atoms": [int(x) for x in atoms[i]], "frames": [[g, e, c] for g, e, c in frames]})
+            detail["scans"] = scans
+        write_json(out / "param" / f"{r.param_id}.json", detail)
 
         # summary statistics: optimization geometries only (unconstrained minima; frozen-bond rows excluded)
         row_src = np.repeat(source_of[t_idx], n_conf_of[t_idx])
@@ -356,8 +413,7 @@ def main() -> None:
             "n_obs_opt": int((row_src == "opt").sum()),
             "n_obs_td": int((row_src == "td").sum()),
             "n_invalid": int((valid == 0).sum()) if is_torsion else 0,
-            "shard": shard,
-            "shard_bytes": len(buf),
+            "detail": f"param/{r.param_id}.json",
         }
         if is_torsion:
             row["opt_stats"] = circular_stats(vv[mask].astype(float), ww[mask])
@@ -394,6 +450,64 @@ def main() -> None:
     pad4(buf)
     buf += atoms.tobytes()
     (out / "assignments.bin").write_bytes(bytes(buf))
+
+    # ---------------- geometry universe of optimization records (SMARTS lookup; no geometry in JS) ----------
+    # geom_opt.bin (schema 2, little-endian): Uint32 x6 header (schema, n_topologies, n_bond, n_angle,
+    # n_proper, n_improper); then per kind in (bond, angle, proper, improper):
+    #   Int32 row_start[n_topologies + 1]   (TD topologies have no rows)
+    #   Int16 atoms[n * k]                   k = 2, 3, 4, 4 (improper: central first, outer sorted)
+    #   Int16 param[n]                       index into params.json, -1 = no Sage parameter
+    #   Uint8 flags[n]                       bit 0 valid dihedral, bit 1 proper about a frozen bond
+    #   (pad to 4) Float32 values[n * w]     w = 1, 1, 1, 3 (improper terms (c,a,b,d), (c,b,d,a), (c,d,a,b))
+    universe = pd.read_parquet(p / "geometry_universe.parquet")
+    kinds = [("bond", 2, 1), ("angle", 3, 1), ("proper", 4, 1), ("improper", 4, 3)]
+    counts_by_kind = {k: int((universe.kind == k).sum()) for k, _, _ in kinds}
+    buf = bytearray(struct.pack("<6I", 2, len(topologies), *[counts_by_kind[k] for k, _, _ in kinds]))
+    for kind, k_atoms, width in kinds:
+        u = universe[universe.kind == kind].sort_values("topology_idx", kind="stable")
+        per_top = u.groupby("topology_idx").size().reindex(topologies.topology_idx, fill_value=0).to_numpy()
+        buf += np.concatenate([[0], np.cumsum(per_top)]).astype("<i4").tobytes()
+        buf += np.array([list(a) for a in u.atoms], dtype="<i2").reshape(-1, k_atoms).tobytes()
+        buf += u.param_idx.to_numpy().astype("<i2").tobytes()
+        buf += (u.valid.to_numpy().astype(np.uint8) | (u.on_frozen_bond.to_numpy().astype(np.uint8) << 1)).tobytes()
+        pad4(buf)
+        buf += np.array([list(v) for v in u["values"]], dtype="<f4").reshape(-1, width).tobytes()
+    (out / "geom_opt.bin").write_bytes(bytes(buf))
+
+    # ---------------- depictions (RDKit.js only renders these) ----------------
+    SHARD = 500
+    dep = pd.read_parquet(p / "depictions.parquet").sort_values("topology_idx").reset_index(drop=True)
+    assert (dep.topology_idx.to_numpy() == np.arange(len(topologies))).all()
+    (out / "depictions").mkdir()
+    for k in range(0, len(dep), SHARD):
+        chunk = dep.iloc[k : k + SHARD]
+        write_json(
+            out / "depictions" / f"{k // SHARD}.json",
+            {
+                "first": k,
+                "molblock_h": chunk.molblock_h.tolist(),
+                "molblock_heavy": chunk.molblock_heavy.tolist(),
+                "heavy_index": [list(map(int, h)) for h in chunk.heavy_index],
+                # bond list of each drawing (bond index = position), so highlights need no molblock parsing
+                "bonds_h": [bond_pairs(mb) for mb in chunk.molblock_h],
+                "bonds_heavy": [bond_pairs(mb) for mb in chunk.molblock_heavy],
+            },
+        )
+    svgs = pd.read_parquet(p / "molecule_svgs.parquet").sort_values("mol_idx").reset_index(drop=True)
+    (out / "molecule_svgs").mkdir()
+    for k in range(0, len(svgs), SHARD):
+        write_json(out / "molecule_svgs" / f"{k // SHARD}.json", {"first": k, "svg": svgs.svg.iloc[k : k + SHARD].tolist()})
+
+    # ---------------- optimization conformer groups (superposition precomputed) ----------------
+    align = pd.read_parquet(p / "conformer_alignment.parquet")
+    groups: dict[str, list] = {}
+    for r in align.sort_values(["ref_topology", "topology"]).itertuples():
+        groups.setdefault(str(int(r.ref_topology)), []).append({"t": int(r.topology), "rmsd": round(float(r.rmsd), 4), "coords": [round(float(c), 4) for c in r.coords]})
+    write_json(out / "conformer_groups.json", groups)
+
+    # ---------------- molecule search: canonical SMILES and fingerprint popcounts (vendored RDKit.js) ------
+    shutil.copy(p / "canonical_smiles.json", out / "canonical_smiles.json")
+    shutil.copy(p / "fp_popcount.bin", out / "fp_popcount.bin")
 
     # ---------------- meta ----------------
     download = json.loads((args.raw / "download_manifest.json").read_text())

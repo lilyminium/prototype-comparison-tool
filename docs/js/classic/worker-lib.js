@@ -63,7 +63,28 @@
     return [...seen.values()];
   }
 
-  const api = { MDL_MOL_OPTIONS, MATCH_OPTIONS, MORGAN_OPTIONS, queryMapInfo, matchTuples };
+  /**
+   * Render a PRECOMPUTED dataset depiction (molblock with 2D coordinates from scripts/08e_depictions.py)
+   * with highlights. Refuses molecules without coordinates, so RDKit.js never lays out a dataset molecule.
+   * Output is identical to Python RDKit for the same molblock/highlights/size (tests/js/render_oracle.test.mjs).
+   */
+  function renderDepiction(RDKit, molblock, atoms, bonds, width, height) {
+    const mol = RDKit.get_mol(molblock, JSON.stringify({ removeHs: false }));
+    if (!mol) throw new Error("could not load a precomputed depiction");
+    try {
+      if (!mol.has_coords()) throw new Error("precomputed depiction has no 2D coordinates");
+      // a conformer that exists but is degenerate (all atoms at one point) is not a usable layout either
+      const conf = (JSON.parse(mol.get_json()).molecules[0].conformers || [])[0];
+      const pts = conf ? conf.coords : [];
+      const spread = pts.length > 1 && pts.some((c) => c[0] !== pts[0][0] || c[1] !== pts[0][1]);
+      if (pts.length > 1 && !spread) throw new Error("precomputed depiction has no 2D coordinates (degenerate)");
+      return mol.get_svg_with_highlights(JSON.stringify({ atoms, bonds, width, height, clearBackground: false }));
+    } finally {
+      mol.delete();
+    }
+  }
+
+  const api = { MDL_MOL_OPTIONS, MATCH_OPTIONS, MORGAN_OPTIONS, queryMapInfo, matchTuples, renderDepiction };
   root.WorkerLib = api;
   if (typeof module !== "undefined" && module.exports) module.exports = api;
 })(typeof self !== "undefined" ? self : globalThis);

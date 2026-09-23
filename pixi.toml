@@ -19,6 +19,7 @@ numpy = "*"
 pandas = "*"
 pyarrow = "*"
 pytest = "*"
+scipy = "*"   # independent superposition oracle in tests/test_alignment.py
 nodejs = ">=22"
 
 [tasks]
@@ -31,14 +32,18 @@ extract = "python scripts/03_extract.py"
 label = { cmd = "python scripts/04_label.py", depends-on = ["extract"] }
 geometry = { cmd = "python scripts/05_geometry.py", depends-on = ["label"] }
 validate-energy = { cmd = "python scripts/06_validate_energy.py --self-test", depends-on = ["geometry"] }
-fingerprints = { cmd = "python scripts/07a_fp_input.py && node scripts/07_fingerprints.mjs && python scripts/07a_fp_input.py --check", depends-on = ["validate-energy"] }
+geometry-universe = { cmd = "python scripts/05b_geometry_universe.py", depends-on = ["validate-energy"] }
+fingerprints = { cmd = "python scripts/07a_fp_input.py && node scripts/07_fingerprints.mjs && python scripts/07a_fp_input.py --check", depends-on = ["geometry-universe"] }
 parity = { cmd = "python scripts/08a_smarts_parity.py && node scripts/08b_smarts_parity.mjs && python scripts/08a_smarts_parity.py --compare", depends-on = ["fingerprints"] }
-site-data = { cmd = "python scripts/09_build_site_data.py", depends-on = ["parity"] }
-# Full offline rebuild: extract -> label -> geometry -> validate-energy -> fingerprints -> parity -> site-data
+align-conformers = { cmd = "python scripts/08d_align_conformers.py", depends-on = ["parity"] }
+depictions = { cmd = "python scripts/08e_depictions.py", depends-on = ["align-conformers"] }
+site-data = { cmd = "python scripts/09_build_site_data.py", depends-on = ["depictions"] }
+# Full offline rebuild: extract -> label -> geometry -> validate-energy -> geometry-universe -> fingerprints
+# -> parity -> align-conformers -> depictions -> site-data
 process = { depends-on = ["site-data"] }
 # Tests
 test-py = "pytest -q tests"
-test-js = { cmd = "python scripts/10_test_fixtures.py && node --test tests/js/", depends-on = ["test-py"] }
+test-js = { cmd = "python scripts/10_test_fixtures.py && python scripts/10b_render_oracle.py && node --test tests/js/", depends-on = ["test-py"] }
 test-e2e = { cmd = "node tests/e2e/smoke.mjs chromium firefox webkit", depends-on = ["test-js"] }
 test = { depends-on = ["test-e2e"] }
 serve = "node tests/e2e/serve.mjs 8000"

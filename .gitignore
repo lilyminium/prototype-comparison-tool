@@ -11,3 +11,4 @@ PLAN.md
 PLAN_precompute.md
 HANDOVER.md
 STATUS.md
+tests/js/render_fixtures.json

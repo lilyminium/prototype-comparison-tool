@@ -76,8 +76,24 @@ def main() -> None:
             }
         )
     smirks = json.loads((p / "parity_input.json").read_text())["smirks"]
+
+    # Geometry-universe rows for the geom_opt.bin decoder test: a random sample plus every row of the first
+    # and last optimization topologies (section boundaries) and every row with no Sage parameter or invalid
+    universe = pd.read_parquet(p / "geometry_universe.parquet")
+    opt_tops = sorted(universe.topology_idx.unique())
+    pick = universe.sample(n=min(len(universe), 6000), random_state=args.seed)
+    edge = universe[universe.topology_idx.isin([opt_tops[0], opt_tops[-1]])]
+    special = universe[(universe.param_idx < 0) & (universe.kind == "proper")]
+    invalid = universe[~universe.valid].head(300)
+    geo = pd.concat([pick, edge, special, invalid])
+    geometry = [
+        {"topology_idx": int(r.topology_idx), "kind": r.kind, "atoms": [int(a) for a in r.atoms], "values": [float(v) for v in r.values], "valid": bool(r.valid), "param_idx": int(r.param_idx), "frozen": bool(r.on_frozen_bond)}
+        for r in geo.itertuples()
+    ]
+    counts = universe.groupby(["topology_idx", "kind"]).size()
+    geometry_counts = {f"{int(t)}:{k}": int(n) for (t, k), n in counts.items() if int(t) in (opt_tops[0], opt_tops[-1])}
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(json.dumps({"rows": rows, "smirks": smirks}))
+    args.out.write_text(json.dumps({"rows": rows, "smirks": smirks, "geometry": geometry, "geometry_counts": geometry_counts, "opt_first_last": [int(opt_tops[0]), int(opt_tops[-1])]}))
     print(f"wrote {len(rows)} rows, {len(smirks)} SMIRKS to {args.out}")
 
 

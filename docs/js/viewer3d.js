@@ -1,10 +1,12 @@
 // 3D viewer (NGL Viewer, the library nglview wraps). One shared viewer in a <dialog>, so at most one
-// extra WebGL context. Optimization records: the QM minimum. TorsionDrive records: an animation over
-// the grid points (ordered by grid angle) synchronized with the QM relative-energy profile.
+// extra WebGL context. Optimization records: the QM minimum, with the molecule's other optimization
+// conformers superposed (alignments and RMSDs precomputed by scripts/08d_align_conformers.py).
+// TorsionDrive records: an animation over the grid points synchronized with the QM energy profile
+// (frame order precomputed). Structures come from the precomputed explicit-H depiction molblock, which is
+// in topology atom order; only its coordinates are replaced with QM coordinates.
 import { scanChart } from "./charts.js";
-import { conformerCoords, fetchBuffer, fetchJSON } from "./data.js";
-import { superpose } from "./align.js";
-import { topologyMolblock } from "./molblock.js";
+import { conformerCoords, depiction, fetchBuffer, fetchJSON } from "./data.js";
+import { withCoordinates } from "./molblock.js";
 
 const HIGHLIGHT = "#eb6834"; // series slot 2; a highlight, not a data series
 // Other conformers of the same molecule (categorical slots 3 and 5; the clicked record keeps element colors)
@@ -60,9 +62,9 @@ function ensureDialog() {
 
 /**
  * Open the viewer for topology t. `highlight`: topology atom indices to emphasise (e.g. the matched
- * atoms). `rdkit(type, args)` calls the RDKit worker; `state` has topologies/molecules.
+ * atoms). `state` has topologies/molecules. All structure data is precomputed.
  */
-export async function openViewer({ t, highlight = [], label = "", state, rdkit }) {
+export async function openViewer({ t, highlight = [], label = "", state }) {
   const T = state.topologies;
   const d = ensureDialog();
   const isTd = T.source[t] === "td";
@@ -76,11 +78,12 @@ export async function openViewer({ t, highlight = [], label = "", state, rdkit }
   d.querySelector(".viewer-conformers").innerHTML = "";
   d.showModal();
 
-  const [NGL, coordsBuf, mb, conformers] = await Promise.all([
+  const [NGL, coordsBuf, dep, conformers, groups] = await Promise.all([
     loadNGL(),
     fetchBuffer(`data/coords_${isTd ? "td" : "opt"}.bin`),
-    rdkit("molblock", { t }),
+    depiction("data/", t),
     fetchJSON("data/conformers.json"),
+    isTd ? null : fetchJSON("data/conformer_groups.json"),
   ]);
   const coords = new Float32Array(coordsBuf);
   const stageEl = d.querySelector(".viewer-stage");
@@ -92,16 +95,13 @@ export async function openViewer({ t, highlight = [], label = "", state, rdkit }
   stage.removeAllComponents();
   stage.handleResize();
 
-  // Frames: optimization = 1; TorsionDrive = grid points sorted by grid angle
-  const frames = [];
-  for (let j = 0; j < T.n_conf[t]; j++) {
-    const c = T.conf_start[t] + j;
-    frames.push({ j, grid: isTd ? conformers.grid_deg[c] : null, energy: isTd ? conformers.rel_energy_kcal[c] : null });
-  }
-  if (isTd) frames.sort((a, b) => a.grid - b.grid);
+  // Frames: optimization = 1; TorsionDrive = grid points in the precomputed grid-angle order
+  const frames = isTd
+    ? T.frame_order[t].map((j) => ({ j, grid: conformers.grid_deg[T.conf_start[t] + j], energy: conformers.rel_energy_kcal[T.conf_start[t] + j] }))
+    : [{ j: 0, grid: null, energy: null }];
   const xyzOf = (f) => conformerCoords(coords, T, t, f.j);
 
-  const sdf = topologyMolblock(mb.molblock, mb.order, xyzOf(frames[0]));
+  const sdf = withCoordinates(dep.molblock_h, xyzOf(frames[0]));
   const comp = await stage.loadFile(new Blob([sdf], { type: "text/plain" }), { ext: "sdf", name: `record-${T.record_id[t]}` });
   comp.addRepresentation("ball+stick", { multipleBond: "symmetric", aspectRatio: 1.8, radiusScale: 0.9 });
   const driven = isTd ? T.driven[t] : null;
@@ -116,7 +116,7 @@ export async function openViewer({ t, highlight = [], label = "", state, rdkit }
     ? `Driven dihedral ${driven.join("-")} highlighted. Each frame is the constrained QM minimum at that grid angle.`
     : `QM-optimized geometry (B3LYP-D3BJ/DZVP); final QM energy ${conformers.energy_hartree[T.conf_start[t]].toFixed(6)} Eh.${emph.length ? " Highlighted atoms: " + emph.join(", ") + "." : ""}`;
   if (!isTd) {
-    await addOtherConformers({ d, t, comp, coords, mb, state, rdkit, conformers });
+    await addOtherConformers({ d, t, comp, dep, state, conformers, groups });
     return;
   }
 
@@ -166,22 +166,19 @@ export async function openViewer({ t, highlight = [], label = "", state, rdkit }
 }
 
 /**
- * Optimization records of the same molecule are separate conformers. Show each with a checkbox,
- * superposed on the clicked record (Kabsch on heavy atoms). Records of one molecule share a canonical
- * MDL SMILES, so SMILES atom n corresponds across records.
+ * Optimization records of the same molecule are separate conformers: each gets a checkbox; all are shown
+ * superposed on the clicked record. Superpositions, RMSDs and relative QM energies are precomputed.
  */
-async function addOtherConformers({ d, t, comp, coords, mb, state, rdkit, conformers }) {
+async function addOtherConformers({ d, t, comp, dep, state, conformers, groups }) {
   const T = state.topologies;
-  const others = state.molecules.topologies[T.mol_idx[t]].filter((u) => u !== t && T.source[u] === "opt");
+  const others = groups[String(t)] || [];
   const box = d.querySelector(".viewer-conformers");
   if (!others.length) return;
   box.hidden = false;
-  const heavy = mb.molblock.split("\n").slice(4, 4 + mb.order.length).map((l) => l.slice(31, 34).trim() !== "H");
-  const target = conformerCoords(coords, T, t, 0);
-  const row = (label, color, checked, onChange) => {
+  const row = (label, color, onChange) => {
     const cb = document.createElement("input");
     cb.type = "checkbox";
-    cb.checked = checked;
+    cb.checked = true;
     cb.addEventListener("change", () => onChange(cb.checked));
     const lab = document.createElement("label");
     lab.className = "inline";
@@ -191,32 +188,26 @@ async function addOtherConformers({ d, t, comp, coords, mb, state, rdkit, confor
     lab.append(cb, sw, label);
     box.append(lab);
   };
+  const dE = (u) => {
+    const e = conformers.opt_group_rel_kcal[T.conf_start[u]];
+    return e === null ? "" : `, ΔE ${e.toFixed(2)} kcal/mol`;
+  };
   const title = document.createElement("div");
   title.className = "muted";
   title.textContent = `${others.length + 1} optimization conformers of this molecule (superposed on heavy atoms):`;
   box.append(title);
-  // Relative QM energies are precomputed (09_build_site_data.py) and only present when all records share
-  // the same QC level
-  const dE = (u) => {
-    const c = T.conf_start[u];
-    return conformers.opt_group_rel_kcal[c] === null ? "" : `, ΔE ${conformers.opt_group_rel_kcal[c].toFixed(2)} kcal/mol`;
-  };
   if (conformers.opt_group_same_level[T.conf_start[t]] === false) {
     const warn = document.createElement("div");
     warn.className = "muted";
     warn.textContent = "Relative QM energies not shown: these records were computed at different QC levels.";
     box.append(warn);
   }
-  row(`record ${T.record_id[t]} (this record, element colours${dE(t)})`, "linear-gradient(90deg,#909090,#ff0d0d,#3050f8)", true, (on) => comp.setVisibility(on));
-  for (const [n, u] of others.entries()) {
-    if (T.mdl_smiles[u] !== T.mdl_smiles[t]) continue; // atom correspondence requires identical canonical SMILES
-    const mbU = await rdkit("molblock", { t: u });
-    const pairs = [];
-    mbU.order.forEach((topU, k) => heavy[k] && pairs.push([topU, mb.order[k]]));
-    const { coords: aligned, rmsd } = superpose(conformerCoords(coords, T, u, 0), target, pairs);
+  row(`record ${T.record_id[t]} (this record, element colours${dE(t)})`, "linear-gradient(90deg,#909090,#ff0d0d,#3050f8)", (on) => comp.setVisibility(on));
+  for (const [n, o] of others.entries()) {
+    const other = await depiction("data/", o.t);
     const color = CONFORMER_COLORS[n % CONFORMER_COLORS.length];
-    const c = await stage.loadFile(new Blob([topologyMolblock(mbU.molblock, mbU.order, aligned)], { type: "text/plain" }), { ext: "sdf" });
+    const c = await stage.loadFile(new Blob([withCoordinates(other.molblock_h, o.coords)], { type: "text/plain" }), { ext: "sdf" });
     c.addRepresentation("ball+stick", { color, multipleBond: "symmetric", aspectRatio: 1.8, radiusScale: 0.7, opacity: 0.85 });
-    row(`record ${T.record_id[u]} (heavy-atom RMSD ${rmsd.toFixed(2)} Å${dE(u)})`, color, true, (on) => c.setVisibility(on));
+    row(`record ${T.record_id[o.t]} (heavy-atom RMSD ${o.rmsd.toFixed(2)} Å${dE(o.t)})`, color, (on) => c.setVisibility(on));
   }
 }
